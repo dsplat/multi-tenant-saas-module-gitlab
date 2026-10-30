@@ -260,8 +260,12 @@ class GitlabClient implements GitlabClientContract
         }
     }
 
+    /**
+     * files API 的 file_path 必须整段编码：GitLab 路由只匹配单个 URL 段，
+     * 字面量 `/` 会让嵌套路径 404（文档示例 app%2Fmodels%2Fapplication.rb）。
+     */
     private function encodePath(string $path): string
     {
-        return implode('/', array_map('rawurlencode', explode('/', trim($path, '/'))));
+        return rawurlencode(trim($path, '/'));
     }
 }
