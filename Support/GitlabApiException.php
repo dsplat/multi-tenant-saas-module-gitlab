@@ -19,6 +19,7 @@ class GitlabApiException extends RuntimeException
         public readonly int $status,
         string $message,
         ?Throwable $previous = null,
+        public readonly string $reason = '',
     ) {
         parent::__construct($message, 0, $previous);
     }
@@ -32,8 +33,28 @@ class GitlabApiException extends RuntimeException
         return new self($status, $message);
     }
 
+    /**
+     * 列表未在限额内取完：不得返回“看起来完整”的伪结果。
+     */
+    public static function forLimit(string $reason): self
+    {
+        return new self(0, sprintf('GitLab 列表未在限额内取完（%s）', $reason), null, $reason);
+    }
+
+    /**
+     * 移动冲突：目标已存在、源并发变化，或网络超时后无法用证据对账。
+     */
+    public static function forConflict(string $reason): self
+    {
+        return new self(409, sprintf('GitLab 移动冲突（%s）', $reason), null, $reason);
+    }
+
     public function isRetryable(): bool
     {
+        if ($this->reason !== '') {
+            return false;
+        }
+
         return $this->status === 0 || $this->status === 429 || $this->status >= 500;
     }
 }

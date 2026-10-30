@@ -124,35 +124,145 @@ class GitlabClient implements GitlabClientContract
         $encoding = (string) ($file['encoding'] ?? 'base64');
         $content = (string) ($file['content'] ?? '');
 
-        $written = $this->repositoryFilePut(
-            $projectId,
-            $newPath,
-            $content,
-            $message,
-            $branch,
-            $encoding === 'base64' ? 'base64' : 'text',
-            $author,
-        );
+        if ($this->repositoryFileExists($projectId, $newPath, $branch)) {
+            throw GitlabApiException::forConflict('target_exists');
+        }
 
-        $this->repositoryFileDelete($projectId, $oldPath, $message, $branch, $author);
+        $endpoint = 'projects/' . rawurlencode((string) $projectId) . '/repository/files/' . $this->encodePath($newPath);
 
-        return $written;
+        $payload = array_filter([
+            'branch' => $branch,
+            'content' => $content,
+            'encoding' => $encoding === 'base64' ? 'base64' : 'text',
+            'commit_message' => $message,
+            'previous_path' => trim($oldPath, '/'),
+            'author_name' => $author,
+        ], static fn ($value) => $value !== null);
+
+        try {
+            // E3：一次提交内 rename（previous_path），不再「先写目标再删源」。
+            return $this->request('PUT', $endpoint, payload: $payload);
+        } catch (GitlabApiException $e) {
+            if ($e->status !== 0) {
+                if (in_array($e->status, [400, 409, 422], true)) {
+                    throw GitlabApiException::forConflict('target_exists');
+                }
+
+                throw $e;
+            }
+
+            // 网络超时：结果可能已提交，按目标/源证据对账，不盲目重放写操作。
+            $targetExists = $this->repositoryFileExists($projectId, $newPath, $branch);
+            $sourceExists = $this->repositoryFileExists($projectId, $oldPath, $branch);
+
+            if ($targetExists && ! $sourceExists) {
+                return $this->repositoryFileGet($projectId, $newPath, $branch);
+            }
+
+            if ($targetExists && $sourceExists) {
+                throw GitlabApiException::forConflict('move_uncertain');
+            }
+
+            throw GitlabApiException::forConflict('move_uncertain_none');
+        }
     }
 
     public function repositoryFileList(int|string $projectId, string $path, ?string $ref = null, bool $recursive = false): array
     {
-        $tree = $this->request(
-            'GET',
-            'projects/' . rawurlencode((string) $projectId) . '/repository/tree',
-            query: array_filter([
-                'path' => trim($path, '/'),
-                'ref' => $ref,
-                'recursive' => $recursive ? 'true' : null,
-                'per_page' => 100,
-            ], static fn ($value) => $value !== null && $value !== ''),
-        );
+        $perPage = min(100, max(1, (int) config('gitlab.list.per_page', 100)));
+        $maxPages = max(1, (int) config('gitlab.list.max_pages', 20));
+        $maxEntries = max(1, (int) config('gitlab.list.max_entries', 5000));
+        $timeBudget = max(1, (int) config('gitlab.list.time_budget_seconds', 20));
+        $deadline = microtime(true) + $timeBudget;
 
-        return array_values(array_filter($tree, 'is_array'));
+        $entries = [];
+        $seen = [];
+        $page = 1;
+
+        while ($page <= $maxPages) {
+            if (microtime(true) > $deadline) {
+                throw GitlabApiException::forLimit('limit_time');
+            }
+
+            [$body, $headers] = $this->requestWithMeta(
+                'GET',
+                'projects/' . rawurlencode((string) $projectId) . '/repository/tree',
+                query: array_filter([
+                    'path' => trim($path, '/'),
+                    'ref' => $ref,
+                    'recursive' => $recursive ? 'true' : null,
+                    'page' => $page,
+                    'per_page' => $perPage,
+                ], static fn ($value) => $value !== null && $value !== ''),
+            );
+
+            $items = array_values(array_filter($body, 'is_array'));
+
+            foreach ($items as $item) {
+                // E2：按稳定标识去重，重复页/重复项不得把结果撑大。
+                $key = (string) ($item['id'] ?? $item['path'] ?? '');
+
+                if ($key === '' || isset($seen[$key])) {
+                    continue;
+                }
+
+                $seen[$key] = true;
+                $entries[] = $item;
+
+                if (count($entries) > $maxEntries) {
+                    throw GitlabApiException::forLimit('limit_entries');
+                }
+            }
+
+            $next = $this->nextPageFromHeaders($headers, $page);
+
+            if ($next === null) {
+                if (count($items) < $perPage || $items === []) {
+                    break;
+                }
+
+                $next = $page + 1;
+            }
+
+            if ($next <= $page) {
+                break;
+            }
+
+            if ($next > $maxPages) {
+                // 仍有下一页但超过配置上限：抛错，不返回伪完整列表。
+                throw GitlabApiException::forLimit('limit_pages');
+            }
+
+            $page = $next;
+        }
+
+        return $entries;
+    }
+
+    /**
+     * 分页只认 GitLab 自己给的 `x-next-page`，不跟随 Link 里的任意 URL（避免凭据发往外部地址）。
+     *
+     * @param  array<string, array<string>>  $headers
+     */
+    private function nextPageFromHeaders(array $headers, int $page): ?int
+    {
+        foreach ($headers as $name => $values) {
+            if (strtolower((string) $name) !== 'x-next-page') {
+                continue;
+            }
+
+            $raw = trim((string) (is_array($values) ? ($values[0] ?? '') : $values));
+
+            if (preg_match('/^\d+$/', $raw) !== 1) {
+                return null;
+            }
+
+            $next = (int) $raw;
+
+            return $next > $page ? $next : null;
+        }
+
+        return null;
     }
 
     public function createWebhook(int|string $projectId, array $attributes): array
@@ -170,6 +280,18 @@ class GitlabClient implements GitlabClientContract
      * @return array<string, mixed>
      */
     private function request(string $method, string $path, array $payload = [], array $query = []): array
+    {
+        return $this->requestWithMeta($method, $path, $payload, $query)[0];
+    }
+
+    /**
+     * 同 request()，并返回响应头（分页用 `x-next-page`）。
+     *
+     * @param  array<string, mixed>  $payload
+     * @param  array<string, mixed>  $query
+     * @return array{0: array<string, mixed>, 1: array<string, array<string>>}
+     */
+    private function requestWithMeta(string $method, string $path, array $payload = [], array $query = []): array
     {
         $url = rtrim($this->baseUrl, '/') . '/api/' . $this->apiVersion . '/' . ltrim($path, '/');
         $attempts = max(1, $this->retryTimes + 1);
@@ -191,7 +313,7 @@ class GitlabClient implements GitlabClientContract
             }
 
             if ($response->successful()) {
-                return $this->decode($response);
+                return [$this->decode($response), $response->headers()];
             }
 
             $last = GitlabApiException::forStatus($response->status());
