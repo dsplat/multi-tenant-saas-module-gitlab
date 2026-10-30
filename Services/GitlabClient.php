@@ -87,15 +87,11 @@ class GitlabClient implements GitlabClientContract
             'author_name' => $author,
         ], static fn ($value) => $value !== null);
 
-        try {
-            return $this->request('PUT', $endpoint, payload: $payload);
-        } catch (GitlabApiException $e) {
-            if ($e->status !== 404) {
-                throw $e;
-            }
-        }
-
-        return $this->request('POST', $endpoint, payload: $payload);
+        // 更新接口对不存在的文件返回 400（"A file with this name doesn't exist"）而非 404，
+        // 异常里又刻意不带响应体，无法据此回落；先在目标分支判存在，决定更新还是创建。
+        return $this->repositoryFileExists($projectId, $path, $branch)
+            ? $this->request('PUT', $endpoint, payload: $payload)
+            : $this->request('POST', $endpoint, payload: $payload);
     }
 
     public function repositoryFileDelete(
@@ -267,5 +263,23 @@ class GitlabClient implements GitlabClientContract
     private function encodePath(string $path): string
     {
         return rawurlencode(trim($path, '/'));
+    }
+
+    /**
+     * 目标分支上文件是否存在（404 视为不存在，其余异常照常上抛）。
+     */
+    private function repositoryFileExists(int|string $projectId, string $path, string $branch): bool
+    {
+        try {
+            $this->repositoryFileGet($projectId, $path, $branch);
+
+            return true;
+        } catch (GitlabApiException $e) {
+            if ($e->status === 404) {
+                return false;
+            }
+
+            throw $e;
+        }
     }
 }
